@@ -3,11 +3,42 @@
 class gAssetManager extends CAssetManager
 {
     public $minifyJs = true;
+    public static $threaded;
+    public static $pids = array();
+    public $transformFunc = 'transformFile';
+    public $newFileMode = 666; //BUG FIX
+    public $newDirMode = 777; //BUG FIX
 
     /**
      * @var array published assets
      */
     private $_published = array();
+
+    static function setThreadMode($threaded) {
+        static::$threaded = $threaded;
+    }
+
+    function __construct() {
+        if (static::$threaded) $this->transformFunc = 'transformFileThreaded';
+        else $this->transformFunc = 'transformFile';
+    }
+
+    static function isPublishThreadFinished($src) {
+        if (!isset(static::$pids[$src])) return true;
+        exec('ps -p '.static::$pids[$src], $op);
+        if (isset($op[1])) return false;
+        else {
+            unset(static::$pids[$src]);
+            return true;
+        }
+    }
+
+    static function isAllThreadsFinished() {
+        foreach (static::$pids as $src=>$pid) {
+            if (!static::isPublishThreadFinished($src)) return false;
+        }
+        return true;
+    }
 
     /**
      * Publishes a file or a directory.
@@ -61,7 +92,7 @@ class gAssetManager extends CAssetManager
                 elseif(!is_dir($dstDir) || $forceCopy)
                 {
                     if (@filemtime($dstDir) < @filemtime($src)) {
-                        self::copyDirectory(
+                        gFileHelper::copyDirectory(
                             $src, $dstDir, array(
                                                 'exclude'     => $this->excludeFiles,
                                                 'level'       => $level,
@@ -80,6 +111,57 @@ class gAssetManager extends CAssetManager
                                     array('{asset}' => $path)));
     }
 
+    /*
+     * Transform file to new file (or just copy)
+     *
+     * @param string $src    path to source
+     * @param string $dst    path to destination
+     * @param string $command    command to execute or 'copy'
+     */
+
+    protected function transformFile($src, $dst, $command, $makeGzip = true) {
+        if ($command == 'copy') {
+            $ok = copy($src, $dst);
+            if (!$ok) {
+                throw new Exception("Can not copy $src to $dst");
+            }
+        } else {
+            exec($command, $output, $code);
+            if($code) {
+                throw new Exception("Can not execute: ".$command."\r\n".join(',', $output));
+            }
+        }
+        @chmod($dst, $this->newFileMode);
+        if ($makeGzip) self::makeGzipVersion($dst);
+        return basename($dst);
+    }
+
+    /*
+ * Transform file to new file (or just copy)
+ *
+ * @param string $src    path to source
+ * @param string $dst    path to destination
+ * @param string $command    command to execute or 'copy'
+ */
+
+    protected function transformFileThreaded($src, $dst, $command, $makeGzip = true) {
+        if ($command == 'copy') {
+            $command = "cp -f $src $dst";
+        }
+        if ($makeGzip) $command .= "&& gzip -fcq $dst > $dst.gz";
+        $command .= "&& chmod -f {$this->newFileMode} $dst";
+
+        //$time = microtime(true);
+        self::$pids[$src] = exec("nohup sh -c '$command' > /dev/null 2>&1 & echo $!", $output, $code);
+        //echo "running at ".(microtime(true)-$time)." seconds\r\n\r\n";
+
+
+        if($code) {
+            throw new Exception("Can not execute: ".$command."\r\n".join(',', $output));
+        }
+        return basename($dst);
+    }
+
     /**
      * Put file into assets directory
      *
@@ -90,76 +172,45 @@ class gAssetManager extends CAssetManager
      * @throws Exception
      * @return string path to result file
      */
-    private function putFileToAsset($src, $dstFile, $jsOnlyGzip = false)
+    public function putFileToAsset($src, $dstFile)
     {
         if(preg_match('/\/bootstrap\//i', $src) ||
             preg_match('/\/imperavi-redactor-widget\//i', $src) ||
             preg_match('/\/yii-debug-toolbar\//i', $src) ||
             preg_match('/category-([a-z]{2}).js/i', $src)
-        )
-        {;
+        ) {
             // just copy into assets directory
-            copy($src, $dstFile);
-            @chmod($dstFile, $this->newFileMode);
-            self::makeGzipVersion($dstFile); // make gzip-version
+            return $this->{$this->transformFunc}($src, $dstFile, 'copy');
+        } else {
+            $ext = pathinfo($src, PATHINFO_EXTENSION);
+            switch ($ext) {
+                case 'js':
+                    if (!$this->minifyJs)
+                        return $this->{$this->transformFunc}($src, $dstFile, 'copy');
+                    else {
+                        $compilerPath = dirname(__FILE__) . '/compiler.jar';
+                        $command = "java -jar {$compilerPath} ";
+                        $command .= "--js={$src} ";
+                        $command .= "--js_output_file={$dstFile}";
+                        return $this->{$this->transformFunc}($src, $dstFile, $command);
+                    }
+                case 'css':
+                    // просто копируем в папку assets
+                    return $this->{$this->transformFunc}($src, $dstFile, 'copy');
+                case 'less':
+                    // compile less into css
+                    $dstFileCss = str_replace('.less', '.css', $dstFile);
 
-            $fileName = basename($dstFile);
-        }
-        else
-        {
-            if(preg_match('/^.*\.js$/i', $src))
-            {
-                if (!$this->minifyJs)
-                    copy($src, $dstFile);
-                else
-                {
-                    $compilerPath = dirname(__FILE__) . '/compiler.jar';
-                    $command = "java -jar {$compilerPath} ";
-                    $command .= "--js={$src} ";
-                    $command .= "--js_output_file={$dstFile}";
-                    exec($command, $output, $code);
-                    if($code)
-                        throw new Exception("Can not compile JavaScript file $dstFile. Check permission rights.");
-                }
-                @chmod($dstFile, $this->newFileMode);
-                self::makeGzipVersion($dstFile);
-                $fileName = basename($dstFile);
-            }
-            elseif(preg_match('/^.*\.css$/i', $src)) // css
-            {
-                // просто копируем в папку assets
-                copy($src, $dstFile);
-                @chmod($dstFile, $this->newFileMode);
+                    $command = "lessc $src -x > $dstFileCss";
+                    return $this->{$this->transformFunc}($src, $dstFileCss, $command);
+                default:
+                    // just copy into assets directory
 
-                self::makeGzipVersion($dstFile); // make gzip-version
-
-                $fileName = basename($dstFile);
-            }
-            elseif(preg_match('/^.*\.less$/i', $src)) // less
-            {
-                // compile less into css
-                $dstFileCss = str_replace('.less', '.css', $dstFile);
-                exec("lessc $src -x > $dstFileCss", $output, $code);
-                if($code)
-                {
-                    throw new Exception(__METHOD__ . " can not exec lessc $src -x > $dstFileCss:" . join(',', $output));
-                }
-                @chmod($dstFileCss, $this->newFileMode);
-
-                self::makeGzipVersion($dstFileCss); // make gzip-version
-
-                $fileName = basename($dstFileCss);
-            }
-            else
-            {
-                // just copy into assets directory
-                copy($src, $dstFile);
-                @chmod($dstFile, $this->newFileMode);
-
-                $fileName = basename($dstFile);
+                    $this->{$this->transformFunc}($src, $dstFile, 'copy', false);
+                    break;
             }
         }
-        return $fileName;
+        return '';
     }
 
     /**
@@ -175,7 +226,16 @@ class gAssetManager extends CAssetManager
         gzclose($fp);
         @chmod($dstFileGz, $this->newFileMode);
     }
+}
 
+class gFileHelper extends CFileHelper {
+    private static $class = null;
+    protected static function mkdir($dst, $options, $recursive) {
+        if (!self::$class) self::$class = new ReflectionClass('CFileHelper');
+        $mkdir = self::$class->getMethod('mkdir');
+        $mkdir->setAccessible(true);
+        $mkdir->invoke(null, $dst, $options, $recursive);
+    }
     /**
      * Copies a directory recursively as another.
      * If the destination directory does not exist, it will be created recursively.
@@ -193,29 +253,10 @@ class gAssetManager extends CAssetManager
 
         self::copyDirectoryRecursive($src, $dst, '', $fileTypes, $exclude, $level, $options);
     }
-
-    /**
-     * Shared environment safe version of mkdir. Supports recursive creation.
-     * For avoidance of umask side-effects chmod is used.
-     */
-    private static function mkdir($dst, array $options, $recursive)
-    {
-        $prevDir = dirname($dst);
-        if($recursive && !is_dir($dst) && !is_dir($prevDir))
-        {
-            self::mkdir(dirname($dst), $options, true);
-        }
-
-        $mode = isset($options['newDirMode']) ? $options['newDirMode'] : 0777;
-        $res = mkdir($dst, $mode);
-        chmod($dst, $mode);
-        return $res;
-    }
-
-    /**
-     * Copies a directory.
-     */
-    private static function copyDirectoryRecursive($src, $dst, $base, $fileTypes, $exclude, $level, $options)
+ /**
+ * Copies a directory.
+ */
+    public static function copyDirectoryRecursive($src, $dst, $base, $fileTypes, $exclude, $level, $options)
     {
         if(!is_dir($dst))
         {
@@ -235,47 +276,21 @@ class gAssetManager extends CAssetManager
             {
                 if($isFile)
                 {
-                    $gA = new gAsset();
-                    $gA->putFileToAsset($path, $dst . DIRECTORY_SEPARATOR . $file, YII_DEBUG);
-
+                    $gA = new gAssetManager();
+                    $fileName = $gA->putFileToAsset($path, $dst . DIRECTORY_SEPARATOR . $file, YII_DEBUG);
+/*
                     if(isset($options['newFileMode']))
                     {
-                        chmod($dst . DIRECTORY_SEPARATOR . $file, $options['newFileMode']);
-                    }
+                        chmod($dst . DIRECTORY_SEPARATOR . $fileName, $options['newFileMode']);
+                    }*/
                 }
                 elseif($level)
                 {
                     self::copyDirectoryRecursive($path, $dst . DIRECTORY_SEPARATOR . $file, $base . '/' . $file,
-                                                 $fileTypes, $exclude, $level - 1, $options);
+                        $fileTypes, $exclude, $level - 1, $options);
                 }
             }
         }
         closedir($folder);
-    }
-
-    /**
-     * Validates a file or directory.
-     */
-    protected static function validatePath($base, $file, $isFile, $fileTypes, $exclude)
-    {
-        foreach($exclude as $e)
-        {
-            if($file === $e || strpos($base . '/' . $file, $e) === 0)
-            {
-                return false;
-            }
-        }
-        if(!$isFile || empty($fileTypes))
-        {
-            return true;
-        }
-        if(($type = pathinfo($file, PATHINFO_EXTENSION)) !== '')
-        {
-            return in_array($type, $fileTypes);
-        }
-        else
-        {
-            return false;
-        }
     }
 }
